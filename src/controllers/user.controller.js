@@ -8,6 +8,11 @@ import crypto from "crypto";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 
+const options = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+};
+
 const generateAccessAndRefreshToken = async (userId) => {
   try {
     const user = await User.findOne(userId);
@@ -26,15 +31,15 @@ const generateAccessAndRefreshToken = async (userId) => {
   }
 };
 
-const sendMail = async(userId, email, message, subject) => {
+const sendMail = async (userId, email, message, subject) => {
   const token = await Token.create({
     _id: userId,
     token: crypto.randomBytes(32).toString("hex"),
   });
 
   const sentMessage = `${message}/${userId}/${token.token}`;
-  await sendEmail(email, subject, sentMessage );
-}
+  await sendEmail(email, subject, sentMessage);
+};
 
 const registerUser = asyncHandler(async (req, res) => {
   const { fullName, email, password } = req.body;
@@ -70,8 +75,14 @@ const registerUser = asyncHandler(async (req, res) => {
     throw new ApiError(500, "Something went wrong, Try again!");
   }
 
+  const { accessToken, refreshToken } = await generateAccessAndRefreshToken(
+    user._id
+  );
+
   res
     .status(201)
+    .cookie("accessToken", accessToken, options)
+    .cookie("refreshToken", refreshToken, options)
     .json(
       new ApiResponse(
         200,
@@ -114,11 +125,6 @@ const loginUser = asyncHandler(async (req, res) => {
     "-password -refreshToken"
   );
 
-  const options = {
-    httpOnly: true,
-    secure: false,
-  };
-
   return res
     .status(200)
     .cookie("accessToken", accessToken, options)
@@ -148,11 +154,6 @@ const logoutUser = asyncHandler(async (req, res) => {
       new: true,
     }
   );
-
-  const options = {
-    httpOnly: true,
-    secure: false,
-  };
 
   return res
     .status(200)
@@ -188,15 +189,16 @@ const updateUserDetails = asyncHandler(async (req, res) => {
   }
 
   const fullName = req?.body?.fullName;
-  
+
   // Ensure avatar files exist before accessing the array index
-  const avatarLocalPath = req?.files?.avatar?.length > 0 ? req.files.avatar[0].path : null;
+  const avatarLocalPath =
+    req?.files?.avatar?.length > 0 ? req.files.avatar[0].path : null;
 
   // Check if there's anything to update
   if (!fullName && !avatarLocalPath) {
-    return res.status(400).json(
-      new ApiResponse(400, null, "Nothing to change")
-    );
+    return res
+      .status(400)
+      .json(new ApiResponse(400, null, "Nothing to change"));
   }
 
   let avatar;
@@ -217,79 +219,115 @@ const updateUserDetails = asyncHandler(async (req, res) => {
     { new: true } // Return the updated document
   ).select("-password -refreshToken");
 
-  res.status(200).json(
-    new ApiResponse(200, updatedUser, "User details updated successfully")
-  );
+  res
+    .status(200)
+    .json(
+      new ApiResponse(200, updatedUser, "User details updated successfully")
+    );
 });
 
 const updatePassword = asyncHandler(async (req, res) => {
-    const { oldPassword, newPassword } = req.body;
+  const { oldPassword, newPassword } = req.body;
 
-    const user = await User.findById(req.user._id);
-    if(!user){
-        throw new ApiError(404, "No user exists with this email"); 
-    }
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    throw new ApiError(404, "No user exists with this email");
+  }
 
-    const isPasswordCorrect = user.isPasswordCorrect(oldPassword);
-    if(!isPasswordCorrect){
-        throw new ApiError(401, "Incorrect old Password")
-    }
+  const isPasswordCorrect = user.isPasswordCorrect(oldPassword);
+  if (!isPasswordCorrect) {
+    throw new ApiError(401, "Incorrect old Password");
+  }
 
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
 
-    await User.findByIdAndUpdate(
-        req.user._id,
-        {
-            password: hashedPassword
-        },
-    )
+  await User.findByIdAndUpdate(req.user._id, {
+    password: hashedPassword,
+  });
 
-    res.status(200).json(new ApiResponse(200, {}, "User Password Updated Successfully"))
+  res
+    .status(200)
+    .json(new ApiResponse(200, {}, "User Password Updated Successfully"));
 });
 
-const verifyRefreshToken = asyncHandler(async( req, res) => {
-  const token = req.header("Authorization")?.replace("Bearer ", "") || req.cookies?.refreshToken;
-  if(!token){
+const verifyRefreshToken = asyncHandler(async (req, res) => {
+  const token =
+    req.header("Authorization")?.replace("Bearer ", "") ||
+    req.cookies?.refreshToken;
+  if (!token) {
     throw new ApiError(401, "unauthorized access");
   }
 
-  
-  const decodedToken = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET);
-  
+  let decodedToken;
+  try {
+    decodedToken = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET);
+  } catch (err) {
+    // Handle JWT errors, including token expiration
+    throw new ApiError(401, "Invalid or expired refresh token");
+  }
+
   const user = await User.findById(decodedToken._id).select("-password");
 
-  if(!user){
-    throw new ApiError(404, "User does not exists")
+  if (!user) {
+    throw new ApiError(404, "User does not exists");
   }
-  
-  if(token !== user.refreshToken){
+
+  if (token !== user.refreshToken) {
     throw new ApiError(401, "Unauthorized access to user");
   }
 
-  res.status(200).json(new ApiResponse(200, user, "RefreshToken verified successfully"))
-
+  res.status(200).json({ authenticated: true });
 });
 
-const forgotPassword = asyncHandler(async(req, res) => {
-  const {email} = req.body;
+const autoLoginUser = asyncHandler(async (req, res) => {
+  const token =
+    req.header("Authorization")?.replace("Bearer ", "") ||
+    req.cookies?.refreshToken;
+
+  // console.log("refresh token: ", token);
+
+  if (!token) {
+    throw new ApiError(401, "Unauthorized access");
+  }
+
+  const decodedToken = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET);
+  const user = await User.findById(decodedToken._id).select(
+    "-password"
+  );
+
+  if (!user || token !== user.refreshToken) {
+    throw new ApiError(401, "Unauthorized access to user");
+  }
+
+  // Generate new access token
+  const accessToken = user.generateAccessToken();
+
+  res
+    .status(200)
+    .cookie("accessToken", accessToken, options)
+    .json(new ApiResponse(200, user, "User logged in automatically"));
+});
+
+const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body;
   // console.log(email);
-  const user = await User.findOne({email: email})
-  if(!user){
-    throw new ApiError(404, "User doesnot exists")
+  const user = await User.findOne({ email: email });
+  if (!user) {
+    throw new ApiError(404, "User doesnot exists");
   }
 
   const message = `${process.env.BASE_URL}/user/forgot-password`;
   const subject = "Email Verification";
   sendMail(user._id, user.email, message, subject);
 
-  res.status(200).send("bad request")
+  res.status(200).send("bad request");
 });
 
-const redirectingUser = asyncHandler(async(req, res) => {
+const redirectingUser = asyncHandler(async (req, res) => {
   const _id = req.id;
 
-  if(_id){
-    await Token.deleteOne({_id: _id})
+  if (_id) {
+    await Token.deleteOne({ _id: _id });
     res.redirect(`http://localhost:5173/Reset-Password?userId=${_id}`);
   } else {
     return res.status(400).send("Bad Request: ID not found");
@@ -297,8 +335,8 @@ const redirectingUser = asyncHandler(async(req, res) => {
 });
 
 const resetPassword = asyncHandler(async (req, res) => {
-  const {_id} = req.query;
-  const {newPassword} = req.body;
+  const { _id } = req.query;
+  const { newPassword } = req.body;
 
   const hashedPassword = await bcrypt.hash(newPassword, 10);
 
@@ -306,16 +344,15 @@ const resetPassword = asyncHandler(async (req, res) => {
     _id,
     {
       $set: {
-        password: hashedPassword
-      }
+        password: hashedPassword,
+      },
     },
     {
       new: true,
     }
   );
 
-  res.status(200).json(new ApiResponse(200, {}, "Password reset successfull"))
-
+  res.status(200).json(new ApiResponse(200, {}, "Password reset successfull"));
 });
 
 export {
@@ -323,6 +360,7 @@ export {
   verifyUser,
   loginUser,
   verifyRefreshToken,
+  autoLoginUser,
   forgotPassword,
   redirectingUser,
   resetPassword,
